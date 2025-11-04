@@ -1,5 +1,5 @@
-import os, json, math, sqlite3, re
-from datetime import datetime
+import os, json, math, sqlite3, re, time
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
@@ -20,7 +20,7 @@ DEFAULT_BBOX = {"west": -114.0715, "south": 51.0455, "east": -114.0665, "north":
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "db.sqlite")
 
-# ---------- DB ----------
+# -------------------------------- DB --------------------------------
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -38,10 +38,31 @@ def init_db():
         filters_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id))""")
+    # cache table for /api/buildings
+    cur.execute("""CREATE TABLE IF NOT EXISTS cache(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL)""")
     con.commit(); con.close()
 init_db()
 
-# ---------- geometry helpers ----------
+def cache_get(key, max_age_seconds):
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT value, updated_at FROM cache WHERE key=?", (key,))
+    row = cur.fetchone(); con.close()
+    if not row: return None
+    updated = datetime.fromisoformat(row["updated_at"])
+    if datetime.utcnow() - updated > timedelta(seconds=max_age_seconds):
+        return None
+    return json.loads(row["value"])
+
+def cache_put(key, value_obj):
+    con = db(); cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO cache(key,value,updated_at) VALUES(?,?,?)",
+                (key, json.dumps(value_obj), datetime.utcnow().isoformat()))
+    con.commit(); con.close()
+
+# -------------------------------- geometry helpers --------------------------------
 def to_meters_xy(lat, lon, lat0, lon0):
     R = 6378137.0
     x = math.radians(lon - lon0) * R * math.cos(math.radians((lat + lat0) / 2.0))
@@ -72,21 +93,34 @@ def estimate_height(tags):
                 except: pass
     return round(float(h if h is not None else 9.0), 2)
 
-# ---------- Overpass ----------
-def fetch_buildings(bbox):
+# -------------------------------- Overpass (retries) --------------------------------
+_requests = requests.Session()
+_requests.headers.update({"User-Agent": "urban-3d/1.0 (contact: none)"})
+
+def _overpass_fetch_json(bbox, retries=3, backoff=2.0):
     q = f"""
-    [out:json][timeout:30];
+    [out:json][timeout:60];
     ( way["building"]({bbox['south']},{bbox['west']},{bbox['north']},{bbox['east']}); );
     (._;>;); out body;
     """
-    r = requests.post(OVERPASS_URL, data=q, timeout=45)
-    r.raise_for_status()
-    data = r.json()
-    nodes = {el["id"]: (el["lat"], el["lon"]) for el in data.get("elements", []) if el["type"] == "node"}
+    last_err = None
+    for attempt in range(1, retries+1):
+        try:
+            r = _requests.post(OVERPASS_URL, data=q, timeout=70)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = RuntimeError(f"Overpass {r.status_code}")
+                time.sleep(backoff * attempt); continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff * attempt)
+    raise last_err
 
+def _buildings_from_overpass_json(bbox, data):
+    nodes = {el["id"]: (el["lat"], el["lon"]) for el in data.get("elements", []) if el["type"] == "node"}
     lat0 = (bbox['south'] + bbox['north'])/2
     lon0 = (bbox['west'] + bbox['east'])/2
-
     buildings = []
     for el in data.get("elements", []):
         if el["type"] != "way": continue
@@ -109,7 +143,7 @@ def fetch_buildings(bbox):
         })
     return buildings
 
-# ---------- LLM / parsing ----------
+# -------------------------------- LLM / parsing --------------------------------
 FT_TO_M = 0.3048
 FT2_TO_M2 = 0.092903
 
@@ -207,9 +241,9 @@ def llm_extract_filter(user_text):
                 elif a in ("area","area_m2"): flt["attribute"] = "area_m2"
                 elif re.fullmatch(LEVEL_WORDS_RE, a): flt["attribute"] = "levels"
                 if flt.get("attribute") == "height_m" and flt.get("value") is not None:
-                    flt["value"] = str(_normalize_height_value_from_text(user_text, str(flt["value"])))
+                    flt["value"] = str(_normalize_height_value_from_text(user_text, str(flt["value"])) )
                 if flt.get("attribute") == "area_m2" and flt.get("value") is not None:
-                    flt["value"] = str(_normalize_area_value_from_text(user_text, str(flt["value"])))
+                    flt["value"] = str(_normalize_area_value_from_text(user_text, str(flt["value"])) )
                 return flt
         except Exception:
             pass
@@ -246,7 +280,15 @@ def apply_filter(buildings, flt):
 
     return [b["id"] for b in buildings if match(b)]
 
-# ---------- Routes ----------
+# -------------------------------- Routes --------------------------------
+@app.get("/")
+def root():
+    return "Urban 3D API OK", 200
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"status":"ok"}), 200
+
 @app.get("/api/buildings")
 def api_buildings():
     bbox = {
@@ -255,10 +297,31 @@ def api_buildings():
         "east": float(request.args.get("east", DEFAULT_BBOX["east"])),
         "north": float(request.args.get("north", DEFAULT_BBOX["north"])),
     }
+    force = request.args.get("refresh") in ("1","true","yes")
+    key = f"b:{bbox['west']:.5f},{bbox['south']:.5f},{bbox['east']:.5f},{bbox['north']:.5f}"
+
+    # 1) serve fresh cache (6 hours)
+    if not force:
+        cached = cache_get(key, max_age_seconds=6*60*60)
+        if cached:
+            cached["source"] = "cache"
+            return jsonify(cached)
+
+    # 2) fetch live with retries
     try:
-        blds = fetch_buildings(bbox)
-        return jsonify({"bbox": bbox, "count": len(blds), "buildings": blds})
+        data = _overpass_fetch_json(bbox)
+        blds = _buildings_from_overpass_json(bbox, data)
+        payload = {"bbox": bbox, "count": len(blds), "buildings": blds}
+        cache_put(key, payload)
+        payload["source"] = "live"
+        return jsonify(payload)
     except Exception as e:
+        # 3) stale fallback if available
+        stale = cache_get(key, max_age_seconds=365*24*60*60)
+        if stale:
+            stale["source"] = "stale-cache"
+            stale["warning"] = f"live fetch failed: {e}"
+            return jsonify(stale)
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/llm-filter")
@@ -313,7 +376,7 @@ def api_load():
     if not row: return jsonify({"error":"not found"}), 404
     return jsonify({"filters": json.loads(row["filters_json"])})
 
-# ✅ NEW: delete a project owned by the username
+# delete a project owned by the username
 @app.post("/api/delete")
 def api_delete():
     data = request.get_json(force=True)
@@ -334,6 +397,5 @@ def api_delete():
     return jsonify({"ok": deleted > 0, "deleted": deleted})
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", "5001"))
     app.run(host="0.0.0.0", port=port)
