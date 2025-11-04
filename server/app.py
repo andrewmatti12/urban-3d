@@ -11,7 +11,8 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 app = Flask(__name__)
 CORS(app)
 
-HF_API_KEY = os.getenv("HF_API_KEY") or ""
+# HF_API_KEY = os.getenv("HF_API_KEY") or ""
+HF_API_KEY = "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"
 HF_MODEL_URL = "https://api-inference.huggingface.co/models/google/flan-t5-base"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
