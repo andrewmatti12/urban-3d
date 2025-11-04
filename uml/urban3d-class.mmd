@@ -1,0 +1,13 @@
+classDiagram
+  class User {
+    +id: int
+    +username: string
+  }
+  class Project {
+    +id: int
+    +user_id: int
+    +name: string
+    +filters_json: json
+    +created_at: datetime
+  }
+  User "1" --> "many" Project

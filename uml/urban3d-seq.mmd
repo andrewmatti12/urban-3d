@@ -1,0 +1,36 @@
+sequenceDiagram
+  autonumber
+  participant U as "User (React UI)"
+  participant A as "App.jsx"
+  participant API as "Flask API"
+  participant DB as "SQLite"
+
+  U->>A: Run query
+  A->>API: POST /api/llm-filter
+  API->>API: Parse to filter
+  API-->>A: Return ids
+  A->>A: Highlight matches
+
+  U->>A: Click building
+  A->>A: Select and show tooltip
+
+  U->>A: Save project
+  A->>API: POST /api/save
+  API->>DB: Insert user and project
+  API-->>A: Ok and project id
+
+  U->>A: Load projects
+  A->>API: GET /api/projects
+  API-->>A: Project list
+
+  U->>A: Load project
+  A->>API: GET /api/load
+  API-->>A: Filters
+  A->>API: POST /api/llm-filter
+  API-->>A: Matching ids
+  A-->>U: Highlight union
+
+  U->>A: Delete project
+  A->>API: POST /api/delete
+  API->>DB: Delete record
+  API-->>A: Ok
